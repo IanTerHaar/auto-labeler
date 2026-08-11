@@ -1,0 +1,31 @@
+name: AutoLabeler
+description: Apply labels to a pull request based on checked checkboxes in the PR body.
+author: IanTerHaar
+branding:
+  icon: tag
+  color: blue
+
+inputs:
+  labels:
+    description: Comma-separated list of known labels to manage (e.g. "bug, chore, feature").
+    required: true
+  token:
+    description: GitHub token used to read and update PR labels.
+    required: false
+    default: ${{ github.token }}
+  fail_on_no_label:
+    description: If true, fail the workflow when no label is selected in the PR template (checkboxes).
+    required: false
+    default: false
+
+runs:
+  using: composite
+  steps:
+    - name: Apply labels from PR checkboxes
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const path = require('path');
+          const applyLabels = require(path.join(process.env.GITHUB_ACTION_PATH, 'scripts', 'apply-labels.js'));
+          await applyLabels({ github, context, core, labelsInput: `${{ inputs.labels }}`, fail_on_no_label: `${{ inputs.fail_on_no_label }}` });
