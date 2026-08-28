@@ -17,6 +17,19 @@ inputs:
     description: If true, fail the workflow when no label is selected in the PR template (checkboxes).
     required: false
     default: false
+  ready_to_merge_label:
+    description: >-
+      Label to apply when the PR meets all configured conditions. Set to an
+      empty string to disable the ready-to-merge feature.
+    required: false
+    default: Ready to Merge
+  ready_to_merge_conditions:
+    description: >-
+      Comma-separated list of conditions required to apply the ready-to-merge
+      label. Supported values: not_draft, mergeable, checks_passing, approved,
+      at_least_one_label. Defaults to all conditions.
+    required: false
+    default: not_draft, mergeable, checks_passing, approved, at_least_one_label
 
 runs:
   using: composite
@@ -28,4 +41,12 @@ runs:
         script: |
           const path = require('path');
           const applyLabels = require(path.join(process.env.GITHUB_ACTION_PATH, 'scripts', 'apply-labels.js'));
-          await applyLabels({ github, context, core, labelsInput: `${{ inputs.labels }}`, fail_on_no_label: `${{ inputs.fail_on_no_label }}` });
+          await applyLabels({
+            github,
+            context,
+            core,
+            labelsInput: `${{ inputs.labels }}`,
+            fail_on_no_label: `${{ inputs.fail_on_no_label }}`,
+            ready_to_merge_label: `${{ inputs.ready_to_merge_label }}`,
+            ready_to_merge_conditions: `${{ inputs.ready_to_merge_conditions }}`,
+          });

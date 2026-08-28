@@ -3,6 +3,11 @@ const assert = require('node:assert/strict');
 
 const { parseKnownLabels } = require('./parse-known-labels');
 const { extractLabelStates } = require('./extract-label-states');
+const {
+  parseConditions,
+  evaluateReadyToMerge,
+  ALL_CONDITIONS,
+} = require('./evaluate-ready-to-merge');
 const applyLabels = require('./apply-labels');
 
 function makeCore() {
@@ -16,8 +21,23 @@ function makeCore() {
   };
 }
 
-function makeGithub({ currentLabels = [], throwOnRemove } = {}) {
-  const calls = { addLabels: [], removeLabel: [], listLabelsOnIssue: [] };
+function makeGithub({
+  currentLabels = [],
+  throwOnRemove,
+  checkRuns = [],
+  combinedStatus = { state: 'success', total_count: 0 },
+  reviews = [],
+  prGetData,
+} = {}) {
+  const calls = {
+    addLabels: [],
+    removeLabel: [],
+    listLabelsOnIssue: [],
+    listChecks: [],
+    getCombinedStatus: [],
+    listReviews: [],
+    pullsGet: [],
+  };
   return {
     calls,
     rest: {
@@ -36,14 +56,56 @@ function makeGithub({ currentLabels = [], throwOnRemove } = {}) {
           }
         },
       },
+      pulls: {
+        get: async (args) => {
+          calls.pullsGet.push(args);
+          return { data: prGetData || {} };
+        },
+        listReviews: async (args) => {
+          calls.listReviews.push(args);
+          return { data: reviews };
+        },
+      },
+      checks: {
+        listForRef: async (args) => {
+          calls.listChecks.push(args);
+          return { data: { total_count: checkRuns.length, check_runs: checkRuns } };
+        },
+      },
+      repos: {
+        getCombinedStatusForRef: async (args) => {
+          calls.getCombinedStatus.push(args);
+          return { data: combinedStatus };
+        },
+      },
     },
   };
 }
 
-function makeContext({ body = '', prNumber = 42, owner = 'o', repo = 'r' } = {}) {
+function makeContext({
+  body = '',
+  prNumber = 42,
+  owner = 'o',
+  repo = 'r',
+  draft = false,
+  mergeable = true,
+  headSha = 'deadbeef',
+  workflow,
+  job,
+} = {}) {
   return {
+    workflow,
+    job,
     repo: { owner, repo },
-    payload: { pull_request: { number: prNumber, body } },
+    payload: {
+      pull_request: {
+        number: prNumber,
+        body,
+        draft,
+        mergeable,
+        head: { sha: headSha },
+      },
+    },
   };
 }
 
@@ -99,6 +161,7 @@ test('applyLabels fails when labels input is empty', async () => {
     context: makeContext(),
     core,
     labelsInput: '   ',
+    ready_to_merge_label: '',
   });
   assert.equal(core.failures.length, 1);
   assert.match(core.failures[0], /No labels provided/);
@@ -111,6 +174,7 @@ test('applyLabels fails when not a pull_request event', async () => {
     context: { repo: { owner: 'o', repo: 'r' }, payload: {} },
     core,
     labelsInput: 'bug',
+    ready_to_merge_label: '',
   });
   assert.equal(core.failures.length, 1);
   assert.match(core.failures[0], /pull_request/);
@@ -124,6 +188,7 @@ test('applyLabels adds checked labels that are missing', async () => {
     context: makeContext({ body: '- [x] bug\n- [x] feature\n- [ ] chore' }),
     core,
     labelsInput: 'bug, chore, feature',
+    ready_to_merge_label: '',
   });
   assert.equal(github.calls.addLabels.length, 1);
   assert.deepEqual(github.calls.addLabels[0].labels.sort(), ['bug', 'feature']);
@@ -138,6 +203,7 @@ test('applyLabels removes unchecked labels that are currently applied', async ()
     context: makeContext({ body: '- [x] bug\n- [ ] chore' }),
     core,
     labelsInput: 'bug, chore',
+    ready_to_merge_label: '',
   });
   assert.equal(github.calls.addLabels.length, 0);
   assert.equal(github.calls.removeLabel.length, 1);
@@ -152,6 +218,7 @@ test('applyLabels does nothing when state already matches', async () => {
     context: makeContext({ body: '- [x] bug\n- [ ] chore' }),
     core,
     labelsInput: 'bug, chore',
+    ready_to_merge_label: '',
   });
   assert.equal(github.calls.addLabels.length, 0);
   assert.equal(github.calls.removeLabel.length, 0);
@@ -167,6 +234,7 @@ test('applyLabels fails when no label selected and fail_on_no_label is true', as
     core,
     labelsInput: 'bug, chore',
     fail_on_no_label: 'true',
+    ready_to_merge_label: '',
   });
   assert.equal(core.failures.length, 1);
   assert.match(core.failures[0], /No label selected/);
@@ -181,6 +249,7 @@ test('applyLabels does not fail when no label selected and fail_on_no_label is f
     core,
     labelsInput: 'bug, chore',
     fail_on_no_label: 'false',
+    ready_to_merge_label: '',
   });
   assert.equal(core.failures.length, 0);
   assert.ok(core.infos.some((m) => /No label changes needed/.test(m)));
@@ -198,6 +267,7 @@ test('applyLabels swallows 404 on removeLabel but rethrows other errors', async 
     context: makeContext({ body: '- [ ] chore' }),
     core,
     labelsInput: 'chore',
+    ready_to_merge_label: '',
   });
   assert.equal(github.calls.removeLabel.length, 1);
 
@@ -213,6 +283,7 @@ test('applyLabels swallows 404 on removeLabel but rethrows other errors', async 
       context: makeContext({ body: '- [ ] chore' }),
       core: core2,
       labelsInput: 'chore',
+      ready_to_merge_label: '',
     }),
     /boom/,
   );
@@ -226,7 +297,360 @@ test('applyLabels ignores labels not in the known list', async () => {
     context: makeContext({ body: '- [x] bug\n- [x] security' }),
     core,
     labelsInput: 'bug',
+    ready_to_merge_label: '',
   });
   assert.deepEqual(github.calls.addLabels[0].labels, ['bug']);
   assert.equal(github.calls.removeLabel.length, 0);
 });
+
+// ---------- parseConditions ----------
+
+test('parseConditions returns all conditions on empty/nullish input', () => {
+  assert.deepEqual(parseConditions(undefined).conditions, [...ALL_CONDITIONS]);
+  assert.deepEqual(parseConditions(null).conditions, [...ALL_CONDITIONS]);
+  assert.deepEqual(parseConditions('').conditions, [...ALL_CONDITIONS]);
+  assert.deepEqual(parseConditions('   ').conditions, [...ALL_CONDITIONS]);
+});
+
+test('parseConditions parses, lowercases, dedupes, and separates unknowns', () => {
+  const { conditions, unknown } = parseConditions(
+    'Not_Draft, mergeable, mergeable, bogus , approved,, another_bad'
+  );
+  assert.deepEqual(conditions, ['not_draft', 'mergeable', 'approved']);
+  assert.deepEqual(unknown.sort(), ['another_bad', 'bogus']);
+});
+
+// ---------- evaluateReadyToMerge ----------
+
+function evalCtx({ workflow, job } = {}) {
+  return { workflow, job, repo: { owner: 'o', repo: 'r' } };
+}
+
+function evalPr({ draft = false, mergeable = true, headSha = 'sha1', number = 7 } = {}) {
+  return { number, draft, mergeable, head: { sha: headSha } };
+}
+
+test('evaluateReadyToMerge: all conditions met -> ready', async () => {
+  const github = makeGithub({
+    checkRuns: [
+      { name: 'ci', status: 'completed', conclusion: 'success' },
+      { name: 'lint', status: 'completed', conclusion: 'skipped' },
+    ],
+    combinedStatus: { state: 'success', total_count: 0 },
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: [...ALL_CONDITIONS],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, true);
+  assert.deepEqual(result.reasons, []);
+});
+
+test('evaluateReadyToMerge: draft PR -> not ready', async () => {
+  const github = makeGithub();
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr({ draft: true }),
+    conditions: ['not_draft'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /draft/i.test(r)));
+});
+
+test('evaluateReadyToMerge: merge conflicts -> not ready', async () => {
+  const github = makeGithub();
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr({ mergeable: false }),
+    conditions: ['mergeable'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /conflict/i.test(r)));
+});
+
+test('evaluateReadyToMerge: fetches PR when mergeable is null', async () => {
+  const github = makeGithub({
+    prGetData: { mergeable: true },
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr({ mergeable: null }),
+    conditions: ['mergeable'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(github.calls.pullsGet.length, 1);
+  assert.equal(result.ready, true);
+});
+
+test('evaluateReadyToMerge: pending / failing checks -> not ready', async () => {
+  const github = makeGithub({
+    checkRuns: [
+      { name: 'ci', status: 'completed', conclusion: 'failure' },
+      { name: 'slow', status: 'in_progress', conclusion: null },
+    ],
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['checks_passing'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /pending/i.test(r)));
+  assert.ok(result.reasons.some((r) => /not passing/i.test(r)));
+});
+
+test('evaluateReadyToMerge: skips own workflow/job check runs', async () => {
+  const github = makeGithub({
+    checkRuns: [
+      { name: 'label', status: 'in_progress', conclusion: null },
+      { name: 'ci', status: 'completed', conclusion: 'success' },
+    ],
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx({ workflow: 'Autolabeler', job: 'label' }),
+    pr: evalPr(),
+    conditions: ['checks_passing'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, true);
+});
+
+test('evaluateReadyToMerge: failing combined status -> not ready', async () => {
+  const github = makeGithub({
+    combinedStatus: { state: 'failure', total_count: 1 },
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['checks_passing'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /combined status/i.test(r)));
+});
+
+test('evaluateReadyToMerge: no approvals -> not ready', async () => {
+  const github = makeGithub({ reviews: [] });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['approved'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /approving/i.test(r)));
+});
+
+test('evaluateReadyToMerge: outstanding changes-requested -> not ready', async () => {
+  const github = makeGithub({
+    reviews: [
+      { user: { login: 'r1' }, state: 'APPROVED' },
+      { user: { login: 'r2' }, state: 'CHANGES_REQUESTED' },
+    ],
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['approved'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /changes-requested/i.test(r)));
+});
+
+test('evaluateReadyToMerge: uses only latest review per reviewer', async () => {
+  const github = makeGithub({
+    reviews: [
+      { user: { login: 'r1' }, state: 'CHANGES_REQUESTED' },
+      { user: { login: 'r1' }, state: 'APPROVED' },
+    ],
+  });
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['approved'],
+    checkedLabelsCount: 1,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, true);
+});
+
+test('evaluateReadyToMerge: no known labels selected -> not ready', async () => {
+  const github = makeGithub();
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr(),
+    conditions: ['at_least_one_label'],
+    checkedLabelsCount: 0,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, false);
+  assert.ok(result.reasons.some((r) => /No known labels/i.test(r)));
+});
+
+test('evaluateReadyToMerge: disabled conditions are skipped', async () => {
+  // Draft, no mergeable, no reviews, no labels -- but only checks_passing enabled.
+  const github = makeGithub();
+  const result = await evaluateReadyToMerge({
+    github,
+    context: evalCtx(),
+    pr: evalPr({ draft: true, mergeable: false }),
+    conditions: ['checks_passing'],
+    checkedLabelsCount: 0,
+    core: makeCore(),
+  });
+  assert.equal(result.ready, true);
+});
+
+// ---------- applyLabels + Ready to Merge integration ----------
+
+test('applyLabels adds Ready to Merge when all conditions pass', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: ['bug'],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug, chore',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(addedLabelSets.some((l) => l.includes('Ready to Merge')));
+});
+
+test('applyLabels does NOT add Ready to Merge when a condition fails', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: [],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'failure' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(!addedLabelSets.some((l) => l.includes('Ready to Merge')));
+  assert.equal(github.calls.removeLabel.length, 0);
+});
+
+test('applyLabels removes Ready to Merge when conditions no longer met', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: ['bug', 'Ready to Merge'],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'failure' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug',
+  });
+  assert.equal(github.calls.removeLabel.length, 1);
+  assert.equal(github.calls.removeLabel[0].name, 'Ready to Merge');
+});
+
+test('applyLabels does not add Ready to Merge when already present', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: ['bug', 'Ready to Merge'],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(!addedLabelSets.some((l) => l.includes('Ready to Merge')));
+});
+
+test('applyLabels honors custom ready_to_merge_label', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: ['bug'],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug',
+    ready_to_merge_label: 'shippable',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(addedLabelSets.some((l) => l.includes('shippable')));
+});
+
+test('applyLabels honors ready_to_merge_conditions subset', async () => {
+  const core = makeCore();
+  // No reviews and no labels checked, but only not_draft + mergeable required.
+  const github = makeGithub({
+    currentLabels: [],
+    reviews: [],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'failure' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [ ] bug' }),
+    core,
+    labelsInput: 'bug',
+    ready_to_merge_conditions: 'not_draft, mergeable',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(addedLabelSets.some((l) => l.includes('Ready to Merge')));
+});
+
+test('applyLabels does not manage Ready to Merge when feature disabled', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: ['bug', 'Ready to Merge'],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'failure' }],
+  });
+  await applyLabels({
+    github,
+    context: makeContext({ body: '- [x] bug' }),
+    core,
+    labelsInput: 'bug',
+    ready_to_merge_label: '',
+  });
+  assert.equal(github.calls.removeLabel.length, 0);
+  assert.equal(github.calls.listChecks.length, 0);
+  assert.equal(github.calls.listReviews.length, 0);
+});
+
