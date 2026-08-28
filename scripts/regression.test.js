@@ -8,6 +8,7 @@ const {
   evaluateReadyToMerge,
   ALL_CONDITIONS,
 } = require('./evaluate-ready-to-merge');
+const { resolvePullRequests } = require('./resolve-pull-requests');
 const applyLabels = require('./apply-labels');
 
 function makeCore() {
@@ -28,6 +29,8 @@ function makeGithub({
   combinedStatus = { state: 'success', total_count: 0 },
   reviews = [],
   prGetData,
+  prGetByNumber,
+  openPullRequests = [],
 } = {}) {
   const calls = {
     addLabels: [],
@@ -37,6 +40,7 @@ function makeGithub({
     getCombinedStatus: [],
     listReviews: [],
     pullsGet: [],
+    pullsList: [],
   };
   return {
     calls,
@@ -59,11 +63,18 @@ function makeGithub({
       pulls: {
         get: async (args) => {
           calls.pullsGet.push(args);
+          if (prGetByNumber && prGetByNumber[args.pull_number]) {
+            return { data: prGetByNumber[args.pull_number] };
+          }
           return { data: prGetData || {} };
         },
         listReviews: async (args) => {
           calls.listReviews.push(args);
           return { data: reviews };
+        },
+        list: async (args) => {
+          calls.pullsList.push(args);
+          return { data: openPullRequests };
         },
       },
       checks: {
@@ -167,7 +178,7 @@ test('applyLabels fails when labels input is empty', async () => {
   assert.match(core.failures[0], /No labels provided/);
 });
 
-test('applyLabels fails when not a pull_request event', async () => {
+test('applyLabels fails when the event has no resolvable PR', async () => {
   const core = makeCore();
   await applyLabels({
     github: makeGithub(),
@@ -177,7 +188,7 @@ test('applyLabels fails when not a pull_request event', async () => {
     ready_to_merge_label: '',
   });
   assert.equal(core.failures.length, 1);
-  assert.match(core.failures[0], /pull_request/);
+  assert.match(core.failures[0], /pull request/i);
 });
 
 test('applyLabels adds checked labels that are missing', async () => {
@@ -652,5 +663,149 @@ test('applyLabels does not manage Ready to Merge when feature disabled', async (
   assert.equal(github.calls.removeLabel.length, 0);
   assert.equal(github.calls.listChecks.length, 0);
   assert.equal(github.calls.listReviews.length, 0);
+});
+
+// ---------- resolvePullRequests ----------
+
+function ctxWithPayload(payload, { owner = 'o', repo = 'r' } = {}) {
+  return { repo: { owner, repo }, payload };
+}
+
+test('resolvePullRequests: uses payload.pull_request when present', async () => {
+  const github = makeGithub();
+  const pr = { number: 1, body: '', head: { sha: 'a' } };
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({ pull_request: pr }),
+    core: makeCore(),
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0], pr);
+  assert.equal(github.calls.pullsGet.length, 0);
+});
+
+test('resolvePullRequests: fetches PR from check_suite.pull_requests', async () => {
+  const github = makeGithub({
+    prGetByNumber: {
+      17: { number: 17, body: '- [x] bug', head: { sha: 'sha17' }, mergeable: true },
+    },
+  });
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({
+      check_suite: {
+        head_sha: 'sha17',
+        pull_requests: [
+          { number: 17, base: { repo: { owner: { login: 'o' }, name: 'r' } } },
+        ],
+      },
+    }),
+    core: makeCore(),
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].number, 17);
+  assert.equal(github.calls.pullsGet[0].pull_number, 17);
+});
+
+test('resolvePullRequests: prefers same-repo PRs from embedded refs', async () => {
+  const github = makeGithub({
+    prGetByNumber: {
+      5: { number: 5, head: { sha: 'x' } },
+    },
+  });
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({
+      check_suite: {
+        head_sha: 'x',
+        pull_requests: [
+          { number: 99, base: { repo: { owner: { login: 'other' }, name: 'fork' } } },
+          { number: 5, base: { repo: { owner: { login: 'o' }, name: 'r' } } },
+        ],
+      },
+    }),
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].number, 5);
+});
+
+test('resolvePullRequests: falls back to listing open PRs by head SHA (forks)', async () => {
+  const github = makeGithub({
+    openPullRequests: [
+      { number: 2, head: { sha: 'other' } },
+      { number: 3, head: { sha: 'target' } },
+    ],
+    prGetByNumber: {
+      3: { number: 3, head: { sha: 'target' } },
+    },
+  });
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({
+      check_suite: { head_sha: 'target', pull_requests: [] },
+    }),
+    core: makeCore(),
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].number, 3);
+  assert.equal(github.calls.pullsList.length, 1);
+});
+
+test('resolvePullRequests: resolves status event via payload.sha', async () => {
+  const github = makeGithub({
+    openPullRequests: [{ number: 8, head: { sha: 'statussha' } }],
+    prGetByNumber: { 8: { number: 8, head: { sha: 'statussha' } } },
+  });
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({ sha: 'statussha' }),
+    core: makeCore(),
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].number, 8);
+});
+
+test('resolvePullRequests: returns [] when nothing resolves', async () => {
+  const github = makeGithub({ openPullRequests: [] });
+  const result = await resolvePullRequests({
+    github,
+    context: ctxWithPayload({}),
+    core: makeCore(),
+  });
+  assert.deepEqual(result, []);
+});
+
+test('applyLabels processes PR resolved from a check_suite event', async () => {
+  const core = makeCore();
+  const github = makeGithub({
+    currentLabels: [],
+    checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+    reviews: [{ user: { login: 'r1' }, state: 'APPROVED' }],
+    prGetByNumber: {
+      42: {
+        number: 42,
+        body: '- [x] bug',
+        draft: false,
+        mergeable: true,
+        head: { sha: 'headsha' },
+      },
+    },
+  });
+  await applyLabels({
+    github,
+    context: ctxWithPayload({
+      check_suite: {
+        head_sha: 'headsha',
+        pull_requests: [
+          { number: 42, base: { repo: { owner: { login: 'o' }, name: 'r' } } },
+        ],
+      },
+    }),
+    core,
+    labelsInput: 'bug',
+  });
+  const addedLabelSets = github.calls.addLabels.map((c) => c.labels);
+  assert.ok(addedLabelSets.some((l) => l.includes('bug')));
+  assert.ok(addedLabelSets.some((l) => l.includes('Ready to Merge')));
 });
 

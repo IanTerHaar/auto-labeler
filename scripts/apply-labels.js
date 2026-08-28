@@ -1,6 +1,7 @@
 const { parseKnownLabels } = require('./parse-known-labels');
 const { extractLabelStates } = require('./extract-label-states');
 const { parseConditions, evaluateReadyToMerge } = require('./evaluate-ready-to-merge');
+const { resolvePullRequests } = require('./resolve-pull-requests');
 
 module.exports = async function applyLabels({
   github,
@@ -31,12 +32,42 @@ module.exports = async function applyLabels({
     core.info(`Ready-to-merge label: ${readyLabel}`);
   }
 
-  const pr = context.payload.pull_request;
-  if (!pr) {
-    core.setFailed('This action must be run from a pull_request or pull_request_target event.');
+  const prs = await resolvePullRequests({ github, context, core });
+  if (!prs || prs.length === 0) {
+    core.setFailed(
+      'Could not resolve a pull request from this event. Run on a pull_request, pull_request_target, pull_request_review, check_suite, or check_run event.',
+    );
     return;
   }
 
+  for (const pr of prs) {
+    await processPullRequest({
+      github,
+      context,
+      core,
+      pr,
+      known,
+      failWhenNoLabel,
+      readyFeatureEnabled,
+      readyLabel,
+      readyLabelLower,
+      ready_to_merge_conditions,
+    });
+  }
+};
+
+async function processPullRequest({
+  github,
+  context,
+  core,
+  pr,
+  known,
+  failWhenNoLabel,
+  readyFeatureEnabled,
+  readyLabel,
+  readyLabelLower,
+  ready_to_merge_conditions,
+}) {
   const body = pr.body || '';
   const { checked, unchecked } = extractLabelStates(body, known);
 
@@ -128,4 +159,4 @@ module.exports = async function applyLabels({
       }
     }
   }
-};
+}

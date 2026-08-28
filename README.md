@@ -7,6 +7,15 @@ A GitHub Action that applies labels to a pull request based on checked checkboxe
 
 ## Usage
 
+Which events you subscribe to determine _when_ the labels are re-evaluated. There are two levels of configuration:
+
+1. **Minimum** — enough for the checkbox → label behavior alone.
+2. **Ready-to-merge** — extra triggers layered on top so the `Ready to Merge` label reacts to reviews, CI, and draft toggles.
+
+### Minimum triggers (ready-to-merge feature disabled)
+
+This is all you need if you only want the checkbox → label behavior. Disable the ready-to-merge feature by setting `ready_to_merge_label` to an empty string.
+
 ```yaml
 name: Autolabeler
 
@@ -17,6 +26,69 @@ on:
 permissions:
   pull-requests: write
   contents: read
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: IanTerHaar/auto-labeler@v<latest_version>
+        with:
+          labels: bug, chore, dependencies, documentation, feature, security
+          fail_on_no_label: true
+          ready_to_merge_label: ''   # disable ready-to-merge
+```
+
+What this covers:
+
+- `opened`, `reopened` — new PRs get labeled.
+- `edited` — checkbox toggles in the PR body re-run the labeler.
+- `synchronize` — new commits re-run the labeler.
+
+### Adding the ready-to-merge feature
+
+The `Ready to Merge` label can only be applied or removed when the workflow runs. Each condition you enable in `ready_to_merge_conditions` reacts to a different kind of change, so you need to subscribe to the corresponding events **on top of the minimum above**. Otherwise the label may lag until the next push or PR edit.
+
+Add only what you need — the table shows exactly which events and permissions each condition requires beyond the minimum.
+
+| Condition            | Extra `on:` events                                                                          | Extra `permissions:`                |
+| -------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `not_draft`          | `pull_request_target` types `ready_for_review`, `converted_to_draft`                        | _(none)_                            |
+| `mergeable`          | _(covered by `synchronize` in the minimum)_                                                 | _(none)_                            |
+| `checks_passing`     | `check_suite: [completed]` and, if you use commit statuses, `status:`                       | `checks: read`, `statuses: read`    |
+| `approved`           | `pull_request_review: [submitted, edited, dismissed]`                                       | _(none)_                            |
+| `at_least_one_label` | _(covered by `edited` in the minimum)_                                                      | _(none)_                            |
+
+### Full example (all ready-to-merge conditions)
+
+This layers every extra trigger and permission on top of the minimum, giving you the full ready-to-merge behavior.
+
+```yaml
+name: Autolabeler
+
+on:
+  # Minimum
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      # for `not_draft`
+      - ready_for_review
+      - converted_to_draft
+  # for `approved`
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  # for `checks_passing`
+  check_suite:
+    types: [completed]
+  status:
+
+permissions:
+  # Minimum
+  pull-requests: write
+  contents: read
+  # for `checks_passing`
   checks: read
   statuses: read
 
@@ -27,14 +99,61 @@ jobs:
       - uses: IanTerHaar/auto-labeler@v<latest_version>
         with:
           labels: bug, chore, dependencies, documentation, feature, security
-          # Optional: fail the workflow when no known label checkbox is selected
           fail_on_no_label: true
-          # Optional: label applied when the PR meets all conditions below
-          # (set to an empty string to disable the ready-to-merge feature)
           ready_to_merge_label: Ready to Merge
-          # Optional: which conditions must be satisfied to apply the label
           ready_to_merge_conditions: not_draft, mergeable, checks_passing, approved, at_least_one_label
 ```
+
+### Partial examples
+
+**Only `approved` (rely on branch protection for CI):**
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+  # for `approved`
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+# ...
+with:
+  labels: bug, chore, feature
+  ready_to_merge_conditions: not_draft, mergeable, approved, at_least_one_label
+```
+
+**Only `checks_passing` (no approval gating):**
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
+  # for `checks_passing`
+  check_suite:
+    types: [completed]
+  status:
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: read
+  statuses: read
+
+# ...
+with:
+  labels: bug, chore, feature
+  ready_to_merge_conditions: not_draft, mergeable, checks_passing, at_least_one_label
+```
+
+### Notes
+
+- On `check_suite`, `check_run`, and `status` events GitHub's payload doesn't include the PR object directly. The action resolves the PR from the event's head SHA — this works for both same-repo and fork PRs (open PRs only).
+- If you don't enable `checks_passing`, you don't need the `check_suite` / `status` triggers or the `checks: read` / `statuses: read` permissions.
+- If you don't enable `approved`, you don't need the `pull_request_review` trigger.
 
 Replace `<latest_version>` with the [latest release tag](https://github.com/IanTerHaar/auto-labeler/releases).
 
@@ -76,14 +195,4 @@ Supported conditions (all enabled by default):
 
 Set `ready_to_merge_conditions` to a comma-separated subset to opt into only some checks (for example, `not_draft, mergeable, checks_passing` if your branch protection already enforces approvals). Set `ready_to_merge_label` to an empty string to disable the feature entirely.
 
-### Required permissions
-
-Reading checks, statuses, and reviews requires the workflow to grant a bit more than the default label-write permissions:
-
-```yaml
-permissions:
-  pull-requests: write
-  contents: read
-  checks: read
-  statuses: read
-```
+See [Adding the ready-to-merge feature](#adding-the-ready-to-merge-feature) for which triggers and permissions each condition needs on top of the minimum setup.
